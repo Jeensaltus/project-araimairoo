@@ -1,0 +1,40 @@
+!unzip TSL_Data.zip
+!pip install tensorflow tensorflowjs
+
+import os
+import numpy as np
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import tensorflowjs as tfjs
+
+ACTIONS = np.array(['eat', 'walk'])
+label_map = {label: num for num, label in enumerate(ACTIONS)}
+
+sequences, labels = [], []
+for action in ACTIONS:
+    for seq in range(30):
+        window = []
+        for frame_num in range(30):
+            res = np.load(f"TSL_Data/{action}/{seq}/{frame_num}.npy")
+            window.append(res.flatten())
+        sequences.append(window)
+        labels.append(label_map[action])
+
+X = np.array(sequences)
+y = to_categorical(labels).astype(int)
+
+# LSTM model for dynamic 30-frame sequence tracking
+model = Sequential([
+    LSTM(64, return_sequences=True, activation='relu', input_shape=(30, 63)),
+    LSTM(64, return_sequences=False, activation='relu'),
+    Dense(32, activation='relu'),
+    Dense(2, activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.fit(X, y, epochs=100)
+
+# Export for browser use
+tfjs.converters.save_keras_model(model, 'tfjs_model')
+!zip -r tfjs_model.zip tfjs_model
