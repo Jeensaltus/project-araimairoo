@@ -1,0 +1,145 @@
+"""Run this file in Google Colab after uploading TSL_Data.zip.
+
+Expected archive structure:
+TSL_Data/eat/<clip>/<frame>.npy
+TSL_Data/idle/<clip>/<frame>.npy
+"""
+
+import zipfile
+from pathlib import Path
+
+
+archive_path = Path("TSL_Data.zip")
+if archive_path.exists() and not Path("TSL_Data").exists():
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(".")
+
+import json
+
+import numpy as np
+import tensorflow as tf
+import tensorflowjs as tfjs
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
+
+
+SEED = 42
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+
+ACTIONS = np.array(["eat", "idle"])
+DATA_PATH = Path("TSL_Data")
+FRAMES_PER_CLIP = 40
+FEATURES_PER_FRAME = 63
+
+
+def load_dataset():
+    sequences, labels = [], []
+    for label, action in enumerate(ACTIONS):
+        action_path = DATA_PATH / action
+        for clip_path in sorted(action_path.iterdir(), key=lambda path: int(path.name)):
+            frames = []
+            for frame in range(FRAMES_PER_CLIP):
+                file_path = clip_path / f"{frame}.npy"
+                if not file_path.exists():
+                    frames = []
+                    break
+                features = np.load(file_path).astype(np.float32).reshape(-1)
+                if features.size != FEATURES_PER_FRAME:
+                    frames = []
+                    break
+                frames.append(features)
+            if len(frames) == FRAMES_PER_CLIP:
+                sequences.append(frames)
+                labels.append(label)
+
+    X = np.asarray(sequences, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.int32)
+    if len(X) == 0:
+        raise ValueError("ไม่พบข้อมูลที่สมบูรณ์ใน TSL_Data")
+    return X, y
+
+
+def augment(sequence):
+    """Light augmentation for landmark sequences without changing the sign."""
+    augmented = sequence.copy()
+    augmented += np.random.normal(0, 0.008, augmented.shape).astype(np.float32)
+    if np.random.random() < 0.5:
+        augmented = np.roll(augmented, np.random.randint(-2, 3), axis=0)
+    return augmented
+
+
+X, y = load_dataset()
+print("Dataset shape:", X.shape, "Labels:", np.bincount(y))
+
+# Hold out 20% for final testing. Validation is taken from the training portion.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=SEED, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.20, random_state=SEED, stratify=y_train
+)
+
+# Add two varied copies of every training clip. Never augment validation/test data.
+X_train_augmented = np.concatenate(
+    [X_train, np.asarray([augment(sample) for sample in X_train]), np.asarray([augment(sample) for sample in X_train])]
+)
+y_train_augmented = np.tile(y_train, 3)
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(FRAMES_PER_CLIP, FEATURES_PER_FRAME)),
+    tf.keras.layers.LSTM(96, return_sequences=True),
+    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.LSTM(64),
+    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.Dense(64, activation="relu"),
+    tf.keras.layers.Dropout(0.20),
+    tf.keras.layers.Dense(len(ACTIONS), activation="softmax"),
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_accuracy", patience=12, mode="max", restore_best_weights=True
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5
+    ),
+]
+
+history = model.fit(
+    X_train_augmented,
+    y_train_augmented,
+    validation_data=(X_val, y_val),
+    epochs=80,
+    batch_size=32,
+    callbacks=callbacks,
+    verbose=1,
+)
+
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+predicted = np.argmax(model.predict(X_test, verbose=0), axis=1)
+print("Test accuracy:", float(test_accuracy))
+print(classification_report(y_test, predicted, target_names=ACTIONS))
+print(confusion_matrix(y_test, predicted))
+
+OUTPUT_PATH = Path("tfjs_model")
+OUTPUT_PATH.mkdir(exist_ok=True)
+tfjs.converters.save_keras_model(model, str(OUTPUT_PATH))
+(OUTPUT_PATH / "labels.json").write_text(
+    json.dumps(
+        {
+            "labels": ACTIONS.tolist(),
+            "frames": FRAMES_PER_CLIP,
+            "features": FEATURES_PER_FRAME,
+            "test_accuracy": float(test_accuracy),
+        },
+        ensure_ascii=False,
+    )
+)
+print("Exported TensorFlow.js model to", OUTPUT_PATH)
