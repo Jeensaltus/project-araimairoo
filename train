@@ -1,40 +1,142 @@
-!unzip TSL_Data.zip
-!pip install tensorflow tensorflowjs
+"""Training script synced with collect.py and the browser inference pipeline.
 
-import os
+This file intentionally mirrors the same settings used by the app and by
+train_eat_colab.py:
+- labels: ["eat", "idle"]
+- frames per clip: 40
+- features per frame: 63
+"""
+
+import json
+from pathlib import Path
+
 import numpy as np
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+import tensorflow as tf
 import tensorflowjs as tfjs
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 
-ACTIONS = np.array(['eat', 'walk'])
-label_map = {label: num for num, label in enumerate(ACTIONS)}
+SEED = 42
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
 
-sequences, labels = [], []
-for action in ACTIONS:
-    for seq in range(30):
-        window = []
-        for frame_num in range(30):
-            res = np.load(f"TSL_Data/{action}/{seq}/{frame_num}.npy")
-            window.append(res.flatten())
-        sequences.append(window)
-        labels.append(label_map[action])
+ACTIONS = np.array(["eat", "idle"])
+DATA_PATH = Path("TSL_Data")
+FRAMES_PER_CLIP = 40
+FEATURES_PER_FRAME = 63
 
-X = np.array(sequences)
-y = to_categorical(labels).astype(int)
 
-# LSTM model for dynamic 30-frame sequence tracking
-model = Sequential([
-    LSTM(64, return_sequences=True, activation='relu', input_shape=(30, 63)),
-    LSTM(64, return_sequences=False, activation='relu'),
-    Dense(32, activation='relu'),
-    Dense(2, activation='softmax')
-])
+def load_dataset():
+    sequences, labels = [], []
+    for label, action in enumerate(ACTIONS):
+        action_path = DATA_PATH / action
+        for clip_path in sorted(action_path.iterdir(), key=lambda path: int(path.name)):
+            frames = []
+            for frame in range(FRAMES_PER_CLIP):
+                file_path = clip_path / f"{frame}.npy"
+                if not file_path.exists():
+                    frames = []
+                    break
+                features = np.load(file_path).astype(np.float32).reshape(-1)
+                if features.size != FEATURES_PER_FRAME:
+                    frames = []
+                    break
+                frames.append(features)
+            if len(frames) == FRAMES_PER_CLIP:
+                sequences.append(frames)
+                labels.append(label)
 
-model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-model.fit(X, y, epochs=100)
+    X = np.asarray(sequences, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.int32)
+    if len(X) == 0:
+        raise ValueError("No complete samples were found in TSL_Data.")
+    return X, y
 
-# Export for browser use
-tfjs.converters.save_keras_model(model, 'tfjs_model')
-!zip -r tfjs_model.zip tfjs_model
+
+def augment(sequence):
+    """Light augmentation that preserves the same feature layout as runtime."""
+    augmented = sequence.copy()
+    augmented += np.random.normal(0, 0.008, augmented.shape).astype(np.float32)
+    if np.random.random() < 0.5:
+        augmented = np.roll(augmented, np.random.randint(-2, 3), axis=0)
+    return augmented
+
+
+X, y = load_dataset()
+print("Dataset shape:", X.shape, "Labels:", np.bincount(y))
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=SEED, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.20, random_state=SEED, stratify=y_train
+)
+
+X_train_augmented = np.concatenate(
+    [
+        X_train,
+        np.asarray([augment(sample) for sample in X_train]),
+        np.asarray([augment(sample) for sample in X_train]),
+    ]
+)
+y_train_augmented = np.tile(y_train, 3)
+
+model = tf.keras.Sequential(
+    [
+        tf.keras.layers.Input(shape=(FRAMES_PER_CLIP, FEATURES_PER_FRAME)),
+        tf.keras.layers.LSTM(96, return_sequences=True),
+        tf.keras.layers.Dropout(0.25),
+        tf.keras.layers.LSTM(64),
+        tf.keras.layers.Dropout(0.25),
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dropout(0.20),
+        tf.keras.layers.Dense(len(ACTIONS), activation="softmax"),
+    ]
+)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_accuracy", patience=12, mode="max", restore_best_weights=True
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5
+    ),
+]
+
+history = model.fit(
+    X_train_augmented,
+    y_train_augmented,
+    validation_data=(X_val, y_val),
+    epochs=80,
+    batch_size=32,
+    callbacks=callbacks,
+    verbose=1,
+)
+
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+predicted = np.argmax(model.predict(X_test, verbose=0), axis=1)
+print("Test accuracy:", float(test_accuracy))
+print(classification_report(y_test, predicted, target_names=ACTIONS))
+print(confusion_matrix(y_test, predicted))
+
+OUTPUT_PATH = Path("tfjs_model")
+OUTPUT_PATH.mkdir(exist_ok=True)
+tfjs.converters.save_keras_model(model, str(OUTPUT_PATH))
+(OUTPUT_PATH / "labels.json").write_text(
+    json.dumps(
+        {
+            "labels": ACTIONS.tolist(),
+            "frames": FRAMES_PER_CLIP,
+            "features": FEATURES_PER_FRAME,
+            "test_accuracy": float(test_accuracy),
+        },
+        ensure_ascii=False,
+    )
+)
+print("Exported TensorFlow.js model to", OUTPUT_PATH)
